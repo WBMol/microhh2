@@ -280,6 +280,158 @@ namespace
     }
 
     template<typename TF>
+    void calc_water_vapour(TF* restrict qv, TF* restrict thl, TF* restrict qt, TF* restrict p,
+                           const int istart, const int iend,
+                           const int jstart, const int jend,
+                           const int kstart, const int kend,
+                           const int jj, const int kk)
+    {
+        // Calculate the qv field (by solving: qt - ql = qv)
+        #pragma omp parallel for
+        for (int k=kstart; k<kend; k++)
+        {
+            const TF ex = exner(p[k]);
+            for (int j=jstart; j<jend; j++)
+                #pragma ivdep
+                for (int i=istart; i<iend; i++)
+                {
+                    const int ijk = i + j*jj + k*kk;
+                    qv[ijk] = qt[ijk] - sat_adjust(thl[ijk], qt[ijk], p[k], ex).ql;
+                }
+        }
+    }
+
+    template<typename TF>
+    void calc_th(TF* const restrict th, const TF* const restrict thl, const TF* const restrict qt,
+                 const TF* const restrict pref, const TF* const restrict exnref,
+                 const int istart, const int iend,
+                 const int jstart, const int jend,
+                 const int kstart, const int kend,
+                 const int jj, const int kk)
+    {
+        #pragma omp parallel for
+        for (int k=kstart; k<kend; ++k)
+        {
+            for (int j=jstart; j<jend; ++j)
+                #pragma ivdep
+                for (int i=istart; i<iend; ++i)
+                {
+                    const int ijk = i + j*jj+ k*kk;
+                    th[ijk] = sat_adjust(thl[ijk], qt[ijk], pref[k], exnref[k]).t * std::pow((TF(1e5) / pref[k]), TF(0.286));
+                }
+        }
+    }
+
+    template<typename TF>
+    void calc_rh(TF* const restrict RH, const TF* const restrict thl, const TF* const restrict qt,
+                 const TF* const restrict pref, const TF* const restrict exnref,
+                 const int istart, const int iend,
+                 const int jstart, const int jend,
+                 const int kstart, const int kend,
+                 const int jj, const int kk)
+    {
+        #pragma omp parallel for
+        for (int k=kstart; k<kend; ++k)
+        {
+            for (int j=jstart; j<jend; ++j)
+                #pragma ivdep
+                for (int i=istart; i<iend; ++i)
+                {
+                    const int ijk = i + j*jj+ k*kk;
+                    const auto sat = sat_adjust(thl[ijk], qt[ijk], pref[k], exnref[k]);
+                    // WM: negative qt can exist, make them positive, non-zero, but very small for this stat
+                    RH[ijk] = (std::max(qt[ijk], TF(1e-11))-sat.ql) / sat.qs * TF(100.);
+                }
+        }
+    }
+
+    template<typename TF>
+    void calc_td(TF* const restrict td, const TF* const restrict rh, const TF* const restrict t, const int istart, const int iend,
+                 const int jstart, const int jend, const int kstart, const int kend, const int jj, const int kk)
+    {
+        constexpr TF b  = 17.368;
+        constexpr TF c  = 238.88;
+
+        #pragma omp parallel for
+        for (int k=kstart; k<kend; ++k)
+        {
+            for (int j=jstart; j<jend; ++j)
+            {
+                #pragma ivdep
+                for (int i=istart; i<iend; ++i)
+                {
+                    const int ijk = i + j*jj + k*kk;
+
+                    // the dew point temperature (Magnus formula)
+                    const TF gamma = std::log(rh[ijk] / TF(100.)) + b * t[ijk] / (c + t[ijk]);
+                    td[ijk] = std::max(c * gamma / (b - gamma), TF(0.));
+                }
+            }
+        }
+    }
+
+    template<typename TF>
+    void calc_mse(TF* const restrict mse, const TF* const restrict T, const TF* const restrict qv, const TF* const restrict z,
+                  const int istart, const int iend,
+                  const int jstart, const int jend,
+                  const int kstart, const int kend,
+                  const int jj, const int kk)
+    {
+        // define some constants, values are as dictated by RCEMIP paper (Wing et al. 2017)
+        constexpr TF cp = 1004.64; // specific heat capacity of dry air (J/kg/K)
+        constexpr TF g  = 9.79764; // acceleration due to gravity (m/s2)
+        constexpr TF Lv = 2.501e6; // latent heat of vaporization (J/kg)
+
+        #pragma omp parallel for
+        for (int k=kstart; k<kend; ++k)
+        {
+            for (int j=jstart; j<jend; ++j)
+            {
+                #pragma ivdep
+                for (int i = istart; i < iend; ++i) {
+                    const int ijk = i + j * jj + k * kk;
+                    mse[ijk] = cp * T[ijk] + g * z[k] + Lv * qv[ijk];
+                }
+            }
+        }
+    }
+
+    template<typename TF>
+    void calc_thetae(TF* const restrict thetae, const TF* const restrict qv, const TF* const restrict p,
+                     const TF* const restrict t, const TF* const restrict td,
+                     const int istart, const int iend,
+                     const int jstart, const int jend,
+                     const int kstart, const int kend,
+                     const int jj, const int kk)
+    {
+        // method based on Bolten (1980), see https://en.wikipedia.org/wiki/Equivalent_potential_temperature#Formula
+        // define some constants for the sub calculations
+        constexpr TF Kd = 0.2854; // Rd/Cpd
+        constexpr TF p0 = 1e5;    // reference pressure
+
+        #pragma omp parallel for
+        for (int k=kstart; k<kend; ++k)
+            for (int j=jstart; j<jend; ++j)
+                #pragma ivdep
+                for (int i=istart; i<iend; ++i)
+                {
+                    const int ijk = i + j * jj + k * kk;
+
+                    // temperature at LCL
+                    const TF t_lcl = TF(1.) / (TF(1.) / (td[ijk] - TF(56.)) + std::log(t[ijk] / td[ijk]) / TF(800.)) + TF(56.);
+
+                    // dry potential temperature at LCL
+                    const TF th_lcl = t[ijk] * std::pow(p0 / (p[k] - e(p[k], qv[ijk])), Kd) * std::pow(t[ijk] / t_lcl, TF(0.28) * qv[ijk]);
+
+                    // and finally, theta_e
+                    thetae[ijk] = th_lcl * std::exp((TF(3036.) / t_lcl - TF(1.78)) * qv[ijk] * (TF(1.) + TF(0.448) * qv[ijk]));
+
+                    // catch -nan values, assume caused by too little moisture -> theta_e = theta
+                    thetae[ijk] = std::max(thetae[ijk], t[ijk] * std::pow(p0 / p[k], Kd));
+                }
+    }
+
+    template<typename TF>
     void calc_N2(TF* restrict N2, const TF* const restrict thl, const TF* const restrict dzi, TF* restrict thvref,
                  const int istart, const int iend,
                  const int jstart, const int jend,
@@ -587,6 +739,8 @@ Thermo_moist<TF>::Thermo_moist(Master& masterin, Grid<TF>& gridin, Fields<TF>& f
     // swupdate..=1 -> base state pressure updated before saturation calculation
     bs.swupdatebasestate = inputin.get_item<bool>("thermo", "swupdatebasestate", "", false);
 
+    swrcemipstats = inputin.get_item<bool>("stats", "swrcemipstats", "", false);
+
     // Time variable surface pressure
     tdep_pbot = std::make_unique<Timedep<TF>>(master, grid, "p_sbot", inputin.get_item<bool>("thermo", "swtimedep_pbot", "", false));
 
@@ -858,6 +1012,76 @@ void Thermo_moist<TF>::get_thermo_field(Field3d<TF>& fld, std::string name, bool
                  &tmp->fld[2*gd.ijcells], gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend, gd.icells, gd.ijcells);
         fields.release_tmp(tmp);
     }
+    else if (name == "th")
+    {
+        calc_th(fld.fld.data(), fields.sp.at("thl")->fld.data(), fields.sp.at("qt")->fld.data(), base.pref.data(), base.exnref.data(),
+                gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend, gd.icells, gd.ijcells);
+    }
+    else if (name == "mse")
+    {
+        // first get the T field
+        auto T = fields.get_tmp();
+        T->loc = gd.sloc;
+        get_thermo_field(*T, "T", false, true);
+
+        // mse calc function goes here
+        calc_mse(fld.fld.data(), T->fld.data(), fields.sp.at("qt")->fld.data(), gd.z.data(),
+                 gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend, gd.icells, gd.ijcells);
+
+        fields.release_tmp(T);
+    }
+    else if (name == "rh")
+    {
+        calc_rh(fld.fld.data(), fields.sp.at("thl")->fld.data(), fields.sp.at("qt")->fld.data(), base.pref.data(), base.exnref.data(),
+                gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend, gd.icells, gd.ijcells);
+    }
+    else if (name == "qv")
+    {
+        calc_water_vapour(fld.fld.data(), fields.sp.at("thl")->fld.data(), fields.sp.at("qt")->fld.data(), base.pref.data(),
+                          gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend, gd.icells, gd.ijcells);
+    }
+
+    else if (name == "thetae")
+    {
+        // get 3 fields required for theta_e calculation
+        auto qv = fields.get_tmp();
+        auto td = fields.get_tmp();
+        auto t  = fields.get_tmp();
+
+        qv->loc = gd.sloc;
+        td->loc = gd.sloc;
+        t->loc  = gd.sloc;
+
+        get_thermo_field(*qv, "qv", true, true);
+        get_thermo_field(*td, "td", true, true);
+        get_thermo_field(*t,  "T",  true, true);
+
+        // calculate thetae
+        calc_thetae(fld.fld.data(), qv->fld.data(), base.pref.data(), t->fld.data(), td->fld.data(),
+                    gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend, gd.icells, gd.ijcells);
+
+        fields.release_tmp(qv);
+        fields.release_tmp(td);
+        fields.release_tmp(t);
+
+    }
+    else if (name == "td")
+    {
+        auto rh = fields.get_tmp();
+        auto T  = fields.get_tmp();
+
+        rh->loc = gd.sloc;
+        T->loc  = gd.sloc;
+
+        get_thermo_field(*rh, "rh", false, true);
+        get_thermo_field(*T,  "T",  false, true);
+
+        calc_td(fld.fld.data(), rh->fld.data(), T->fld.data(), gd.istart, gd.iend, gd.jstart, gd.jend, gd.kstart, gd.kend,
+                gd.icells, gd.ijcells);
+
+        fields.release_tmp(rh);
+        fields.release_tmp(T);
+    }
     else
     {
         std::string error_message = "Can not get thermo field: \"" + name + "\"";
@@ -1020,6 +1244,53 @@ void Thermo_moist<TF>::create_stats(Stats<TF>& stats)
         stats.add_profs(*ql, "z", {"mean", "frac", "path", "cover"}, group_name);
         fields.release_tmp(ql);
 
+        if (swrcemipstats)
+        {
+            const std::string rcemip_group = "rcemip";
+
+            auto mse = fields.get_tmp();
+            mse->name = "mse";
+            mse->longname = "Moist static energy";
+            mse->unit = "J kg-1";
+            stats.add_profs(*mse, "z", {"mean", "2", "3", "4", "path"}, rcemip_group);
+            fields.release_tmp(mse);
+
+            auto thetae = fields.get_tmp();
+            thetae->name = "thetae";
+            thetae->longname = "Equivalent potential temperature";
+            thetae->unit = "K";
+            stats.add_profs(*thetae, "z", {"mean", "2", "3", "4"}, rcemip_group);
+            fields.release_tmp(thetae);
+
+            auto td = fields.get_tmp();
+            td->name = "td";
+            td->longname = "Dewpoint temperature";
+            td->unit = "K";
+            stats.add_profs(*td, "z", {"mean", "2", "3", "4"}, rcemip_group);
+            fields.release_tmp(td);
+
+            auto th = fields.get_tmp();
+            th->name = "th";
+            th->longname = "Potential temperature";
+            th->unit = "K";
+            stats.add_profs(*th, "z", {"mean", "2", "3", "4"}, rcemip_group);
+            fields.release_tmp(th);
+
+            auto t = fields.get_tmp();
+            t->name = "t";
+            t->longname = "Dry-bulb temperature";
+            t->unit = "K";
+            stats.add_profs(*t, "z", {"mean", "2", "3", "4"}, rcemip_group);
+            fields.release_tmp(t);
+
+            auto rh = fields.get_tmp();
+            rh->name = "rh";
+            rh->longname = "Relative humidity";
+            rh->unit = "%";
+            stats.add_profs(*rh, "z", {"mean", "2", "3", "4"}, rcemip_group);
+            fields.release_tmp(rh);
+        }
+
         stats.add_time_series("zi", "Boundary Layer Depth", "m", group_name);
         stats.add_tendency(*fields.mt.at("w"), "zh", tend_name, tend_longname, group_name);
     }
@@ -1126,6 +1397,38 @@ void Thermo_moist<TF>::exec_stats(Stats<TF>& stats)
         stats.set_prof("rhoh"   , bs_stats.rhorefh);
     }
 
+    if (swrcemipstats)
+    {
+
+        auto tmp = fields.get_tmp();
+        tmp->loc = gd.sloc;
+
+        // absolute temperature
+        get_thermo_field(*tmp, "T", true, true);
+        stats.calc_stats("t", *tmp, no_offset, no_threshold);
+
+        // moist static energy related stuff
+        get_thermo_field(*tmp, "mse", true, true);
+        stats.calc_stats("mse", *tmp, no_offset, no_threshold);
+
+        // relative humidity
+        get_thermo_field(*tmp, "rh", true, true);
+        stats.calc_stats("rh", *tmp, no_offset, no_threshold);
+
+        // equivalent potential temperature
+        get_thermo_field(*tmp, "thetae", true, true);
+        stats.calc_stats("thetae", *tmp, no_offset, no_threshold);
+
+        // dew point
+        get_thermo_field(*tmp, "td", true, true);
+        stats.calc_stats("td", *tmp, no_offset, no_threshold);
+
+        // (dry) potential temperature
+        get_thermo_field(*tmp, "th", true, true);
+        stats.calc_stats("th", *tmp, no_offset, no_threshold);
+
+        fields.release_tmp(tmp);
+    }
     stats.set_timeseries("zi", gd.z[get_bl_depth()]);
 
 }

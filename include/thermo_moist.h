@@ -122,6 +122,7 @@ class Thermo_moist : public Thermo<TF>
         std::vector<std::string> available_masks;   // Vector with the masks that fields can provide
 
         enum class Basestate_type {anelastic, boussinesq};
+        bool swrcemipstats;
 
         struct Background_state
         {

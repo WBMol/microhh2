@@ -94,6 +94,12 @@ namespace Thermo_moist_functions
     }
 
     template<typename TF>
+    CUDA_MACRO inline TF e(const TF p, const TF qv)
+    {
+        return p*qv/(TF(0.622)+qv);
+    }
+
+    template<typename TF>
     CUDA_MACRO inline TF qsat(const TF p, const TF T)
     {
         return ep<TF>*esat(T)/(p-(TF(1.)-ep<TF>)*esat(T));
